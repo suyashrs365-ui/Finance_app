@@ -8,6 +8,7 @@ import { Analytics } from './components/Analytics';
 import { BankBalances } from './components/BankBalances';
 import { SheetManager, SheetConfig } from './components/SheetManager';
 import { AddTransactionModal } from './components/AddTransactionModal';
+import { LoginPage } from './components/LoginPage';
 import { cn, formatCurrency } from './lib/utils';
 
 // ─────────────────────────────────────────────────────────────
@@ -29,6 +30,12 @@ function parseDateVal(d: string): number {
 // Main App
 // ─────────────────────────────────────────────────────────────
 export default function App() {
+  const [isAuthed, setIsAuthed] = useState(() => localStorage.getItem('wm_auth') === '1');
+  if (!isAuthed) return <LoginPage onLogin={() => setIsAuthed(true)} />;
+  return <AuthedApp onLogout={() => { localStorage.removeItem('wm_auth'); setIsAuthed(false); }} />;
+}
+
+function AuthedApp({ onLogout }: { onLogout: () => void }) {
   const [sheets, setSheets] = useState<SheetConfig[]>([MASTER]);
   const [activeSheetId, setActiveSheetId] = useState('master');
   const [sheetData, setSheetData] = useState<Record<string,Transaction[]>>({ master: INITIAL_TRANSACTIONS });
@@ -273,6 +280,14 @@ export default function App() {
                 onConnect={async()=>{try{const{url}=await fetch('/api/auth/url').then(r=>r.json());window.open(url,'_blank','width=600,height=700');}catch{showToast('❌ Auth failed');}}}
                 onAddSheet={addSheet} onRemoveSheet={removeSheet} onSwitchSheet={switchSheet} onSyncSheet={syncSheet}/>
               {!isConnected && <button onClick={()=>{}} className="text-[10px] font-bold text-zinc-400 flex items-center gap-1"><LinkIcon className="w-3 h-3"/>Connect</button>}
+              {/* Logout */}
+              <button
+                onClick={onLogout}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 text-[9px] font-black text-zinc-400 hover:text-rose-500 hover:bg-rose-50 border border-zinc-200 rounded-lg transition-all uppercase tracking-wide"
+                title="Sign out">
+                <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+                Logout
+              </button>
             </div>
           </div>
 
