@@ -410,6 +410,162 @@ app.post('/api/gemini/chat', async (req, res) => {
   }
 });
 
+// ─── CSV UPLOAD + GEMINI AUTO-DETECT ─────────────────────────────────────────
+app.post('/api/csv/analyze', async (req, res) => {
+  const { csvText, apiKey: clientKey, sheetName } = req.body;
+  if (!csvText) return res.status(400).json({ error: 'CSV text required' });
+
+  const apiKey = clientKey || process.env.GEMINI_API_KEY;
+
+  // Parse CSV helper
+  function parseCSVLine(line: string): string[] {
+    const result: string[] = [];
+    let cell = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (inQuotes && line[i + 1] === '"') { cell += '"'; i++; }
+        else inQuotes = !inQuotes;
+      } else if (ch === ',' && !inQuotes) {
+        result.push(cell.trim());
+        cell = '';
+      } else {
+        cell += ch;
+      }
+    }
+    result.push(cell.trim());
+    return result;
+  }
+
+  const lines = csvText.split('\n').map((l: string) => l.replace(/\r$/, '')).filter((l: string) => l.trim());
+  if (lines.length < 2) return res.status(400).json({ error: 'CSV has no data rows' });
+
+  const headers = parseCSVLine(lines[0]);
+  const sampleRows = lines.slice(1, Math.min(6, lines.length)).map((l: string) => parseCSVLine(l));
+
+  let columnMapping: Record<string, string> = {};
+
+  // Try Gemini to auto-detect column mapping
+  if (apiKey) {
+    try {
+      const sampleTable = [headers, ...sampleRows].map(r => r.join(' | ')).join('\n');
+      const prompt = `You are a finance data analyst. Analyze this CSV data and map each column to the correct transaction field.
+
+CSV Headers and sample rows:
+${sampleTable}
+
+Available transaction fields:
+- date: transaction date (format DD-Mon-YY e.g. "05-May-26")
+- person: person name (Suyash, Rohini, Mummy, etc.)
+- type: transaction type (Income, Fixed, Variable, Investment, Transfer)
+- mainCategory: main category (Food, Transport, Utilities, etc.)
+- subCategory: sub category
+- description: transaction description/narration
+- bank: bank or account name
+- mode: payment mode (UPI, Cash, Card, NEFT, etc.)
+- dr: debit/expense amount (number only)
+- cr: credit/income amount (number only)
+- nature: optional nature field
+
+Return ONLY a valid JSON object mapping CSV column names to transaction field names. Example:
+{"Date": "date", "Narration": "description", "Debit": "dr", "Credit": "cr", "Bank": "bank"}
+
+If a column doesn't match any field, skip it. If you can detect amounts in a single "Amount" column with +/- signs, map it to "amount_combined".`;
+
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            generationConfig: { maxOutputTokens: 500, temperature: 0 }
+          })
+        }
+      );
+      const data = await response.json();
+      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        columnMapping = JSON.parse(jsonMatch[0]);
+        console.log('✅ Gemini column mapping:', columnMapping);
+      }
+    } catch (e) {
+      console.error('Gemini CSV analysis error:', e);
+    }
+  }
+
+  // Fallback: heuristic mapping if Gemini fails
+  if (Object.keys(columnMapping).length === 0) {
+    headers.forEach(h => {
+      const lh = h.toLowerCase();
+      if (lh.includes('date')) columnMapping[h] = 'date';
+      else if (lh.includes('person') || lh.includes('name')) columnMapping[h] = 'person';
+      else if (lh.includes('type')) columnMapping[h] = 'type';
+      else if (lh.includes('main') || lh.includes('category')) columnMapping[h] = 'mainCategory';
+      else if (lh.includes('sub')) columnMapping[h] = 'subCategory';
+      else if (lh.includes('desc') || lh.includes('narr') || lh.includes('remark') || lh.includes('particular')) columnMapping[h] = 'description';
+      else if (lh.includes('bank') || lh.includes('account')) columnMapping[h] = 'bank';
+      else if (lh.includes('mode') || lh.includes('channel')) columnMapping[h] = 'mode';
+      else if (lh.includes('dr') || lh.includes('debit') || lh.includes('out') || lh.includes('expense') || lh.includes('withdraw')) columnMapping[h] = 'dr';
+      else if (lh.includes('cr') || lh.includes('credit') || lh.includes('in') || lh.includes('income') || lh.includes('deposit')) columnMapping[h] = 'cr';
+      else if (lh.includes('nature')) columnMapping[h] = 'nature';
+      else if (lh.includes('amount') || lh.includes('amt')) columnMapping[h] = 'amount_combined';
+    });
+  }
+
+  // Now parse ALL rows using the mapping
+  const transactions: any[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cols = parseCSVLine(lines[i]);
+    if (cols.length < 2) continue;
+
+    const t: any = { id: `csv-${Date.now()}-${i}` };
+    headers.forEach((header, idx) => {
+      const field = columnMapping[header];
+      if (!field) return;
+      const val = (cols[idx] || '').trim();
+
+      if (field === 'dr' || field === 'cr') {
+        t[field] = parseFloat(val.replace(/[,₹$\s]/g, '')) || 0;
+      } else if (field === 'amount_combined') {
+        const num = parseFloat(val.replace(/[,₹$\s]/g, ''));
+        if (!isNaN(num)) {
+          if (num < 0) t.dr = Math.abs(num);
+          else t.cr = num;
+        }
+      } else {
+        t[field] = val;
+      }
+    });
+
+    // Defaults
+    t.person = t.person || 'Suyash';
+    t.type = t.type || 'Variable';
+    t.mainCategory = t.mainCategory || 'Other';
+    t.subCategory = t.subCategory || '';
+    t.description = t.description || '';
+    t.bank = t.bank || '';
+    t.mode = t.mode || '';
+    t.dr = t.dr || 0;
+    t.cr = t.cr || 0;
+    t.nature = t.nature || '';
+
+    // Skip empty rows
+    if (!t.date && !t.description && t.dr === 0 && t.cr === 0) continue;
+    transactions.push(t);
+  }
+
+  console.log(`✅ CSV analyzed: ${transactions.length} transactions from "${sheetName || 'uploaded CSV'}" (Gemini mapping: ${Object.keys(columnMapping).length > 0 ? 'yes' : 'heuristic'})`);
+  res.json({
+    transactions,
+    columnMapping,
+    usedGemini: Object.keys(columnMapping).length > 0,
+    rowCount: transactions.length
+  });
+});
+
 // Named Sheets registry (server-side session storage)
 app.get('/api/sheets/list', (req, res) => {
   const sheets = (req.session as any).sheets || [];

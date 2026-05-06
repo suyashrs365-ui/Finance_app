@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { RefreshCcw, LinkIcon, LayoutDashboard, BookOpen, Landmark, TrendingUp, Bell, BarChart3, Plus, Search, Download, ChevronUp, ChevronDown, Minus, Menu, X, Sparkles, ChevronLeft, ChevronRight, ArrowRight, CalendarDays, Wallet, CreditCard, PiggyBank, Key, Send, Loader2, CheckCircle, TrendingDown, Gem, Wifi, Smartphone, Zap, Shield, Clock, AlertTriangle } from 'lucide-react';
-import { INITIAL_TRANSACTIONS, Transaction } from './data';
+import { Transaction } from './data';
 import { TransactionRow } from './components/TransactionRow';
 import { StatsGrid } from './components/StatsGrid';
 import { Analytics } from './components/Analytics';
@@ -18,7 +18,15 @@ type Page = 'dashboard' | 'ledger' | 'accounts' | 'investments' | 'subscriptions
 type SortKey = 'date' | 'dr' | 'cr' | 'person' | 'type' | 'mainCategory';
 type SortDir = 'asc' | 'desc';
 
-const MASTER: SheetConfig = { id: 'master', name: 'Master Ledger', spreadsheetId: '', range: '', lastSynced: null };
+// ─── Primary Google Sheet (hardcoded) ──────────────────────────────────────
+const PRIMARY_SHEET_ID = '1stiYovLYxif_Gc5gGu8PxG4xPLnL0qjoWilKVsOPQes';
+const PRIMARY_SHEET: SheetConfig = {
+  id: 'primary',
+  name: "Family Ledger",
+  spreadsheetId: PRIMARY_SHEET_ID,
+  range: 'Sheet1!A1:K5000',
+  lastSynced: null
+};
 
 function parseDateVal(d: string): number {
   const m: Record<string,number> = {Jan:1,Feb:2,Mar:3,Apr:4,May:5,Jun:6,Jul:7,Aug:8,Sep:9,Oct:10,Nov:11,Dec:12};
@@ -39,10 +47,10 @@ export default function App() {
 // Main App (shown after login)
 // ─────────────────────────────────────────────────────────────
 function AuthedApp({ onLogout }: { onLogout: () => void }) {
-  const [sheets, setSheets] = useState<SheetConfig[]>([MASTER]);
-  const [activeSheetId, setActiveSheetId] = useState('master');
-  const [sheetData, setSheetData] = useState<Record<string,Transaction[]>>({ master: INITIAL_TRANSACTIONS });
-  const ledger = sheetData[activeSheetId] || INITIAL_TRANSACTIONS;
+  const [sheets, setSheets] = useState<SheetConfig[]>([PRIMARY_SHEET]);
+  const [activeSheetId, setActiveSheetId] = useState('primary');
+  const [sheetData, setSheetData] = useState<Record<string,Transaction[]>>({ primary: [] });
+  const ledger = sheetData[activeSheetId] || [];
 
   const [isConnected, setIsConnected] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
@@ -67,13 +75,13 @@ function AuthedApp({ onLogout }: { onLogout: () => void }) {
   const [geminiLoading, setGeminiLoading] = useState(false);
   const [geminiHistory, setGeminiHistory] = useState<{role:string;content:string}[]>([]);
 
-  const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(null), 3000); };
+  const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(null), 3500); };
 
   useEffect(() => { fetch('/api/auth/status').then(r=>r.json()).then(d=>setIsConnected(d.isAuthenticated)).catch(()=>{}); }, []);
 
-  const syncSheet = useCallback(async (id: string) => {
+  const syncSheet = useCallback(async (id: string, silent = false) => {
     const s = sheets.find(x => x.id === id);
-    if (!s?.spreadsheetId) { showToast('❌ No sheet ID'); return; }
+    if (!s?.spreadsheetId) { if (!silent) showToast('ℹ️ CSV import — re-upload to refresh data'); return; }
     setIsSyncing(true);
     try {
       // Try public import first (no OAuth needed for shared sheets)
@@ -85,17 +93,46 @@ function AuthedApp({ onLogout }: { onLogout: () => void }) {
       if (d.error && isConnected) {
         d = await fetch('/api/gsheets/import', {
           method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({ spreadsheetId: s.spreadsheetId, range: s.range || 'Sheet1!A1:K2000' })
+          body: JSON.stringify({ spreadsheetId: s.spreadsheetId, range: s.range || 'Sheet1!A1:K5000' })
         }).then(r=>r.json());
       }
       if (d.transactions?.length) {
         setSheetData(p=>({...p,[id]:d.transactions}));
         setSheets(p=>p.map(x=>x.id===id?{...x,lastSynced:new Date().toLocaleTimeString('en-IN'),rowCount:d.transactions.length}:x));
-        showToast(`✅ Scanned ${d.transactions.length} rows`);
-      } else showToast(d.error ? `❌ ${d.error}` : '⚠️ No data found');
-    } catch { showToast('❌ Scan failed'); }
+        // Save today's sync date for daily auto-scan tracking
+        localStorage.setItem('wm_last_daily_sync', new Date().toDateString());
+        if (!silent) showToast(`✅ Scanned ${d.transactions.length} rows`);
+        else showToast(`🌅 Auto-synced ${d.transactions.length} rows`);
+      } else if (!silent) showToast(d.error ? `❌ ${d.error}` : '⚠️ No data found');
+    } catch { if (!silent) showToast('❌ Scan failed'); }
     finally { setIsSyncing(false); }
   }, [sheets, isConnected]);
+
+  // ─── AUTO-SYNC ON APP LOAD ────────────────────────────────────────
+  // Auto-scan the primary sheet when the app first loads
+  useEffect(() => {
+    const timer = setTimeout(() => syncSheet('primary', true), 800);
+    return () => clearTimeout(timer);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ─── DAILY MORNING AUTO-SCAN (6 AM) ─────────────────────────────
+  // Every minute, check if it’s past 6 AM and we haven’t synced today yet
+  useEffect(() => {
+    const checkDailySync = () => {
+      const now = new Date();
+      const lastSync = localStorage.getItem('wm_last_daily_sync');
+      const todayStr = now.toDateString();
+      const isMorning = now.getHours() >= 6; // 6:00 AM+
+      if (isMorning && lastSync !== todayStr) {
+        console.log('🌅 Daily morning auto-scan triggered at', now.toLocaleTimeString('en-IN'));
+        syncSheet('primary', true);
+      }
+    };
+    // Check immediately on mount, then every 60 seconds
+    checkDailySync();
+    const interval = setInterval(checkDailySync, 60_000);
+    return () => clearInterval(interval);
+  }, [syncSheet]);
 
   const addSheet = async (cfg: Omit<SheetConfig,'id'|'lastSynced'>) => {
     const id = `sheet-${Date.now()}`;
@@ -121,15 +158,23 @@ function AuthedApp({ onLogout }: { onLogout: () => void }) {
   };
 
   const removeSheet = (id: string) => {
-    if (id==='master') return;
+    if (id==='primary') return; // cannot delete the primary sheet
     setSheets(p=>p.filter(x=>x.id!==id));
     setSheetData(p=>{const n={...p};delete n[id];return n;});
-    if (activeSheetId===id) setActiveSheetId('master');
+    if (activeSheetId===id) setActiveSheetId('primary');
   };
 
   const switchSheet = (id: string) => {
     setActiveSheetId(id);
     showToast(`Switched to "${sheets.find(s=>s.id===id)?.name}"`);
+  };
+
+  const importCSV = (name: string, transactions: Transaction[]) => {
+    const id = `csv-${Date.now()}`;
+    setSheets(p=>[...p,{id,name,spreadsheetId:'',range:'',lastSynced:new Date().toLocaleTimeString('en-IN'),rowCount:transactions.length}]);
+    setSheetData(p=>({...p,[id]:transactions}));
+    setActiveSheetId(id);
+    showToast(`✅ "${name}" imported — ${transactions.length} rows`);
   };
 
   const addTx = (t: Transaction) => {
@@ -271,17 +316,24 @@ function AuthedApp({ onLogout }: { onLogout: () => void }) {
               </div>
             </div>
             <div className="flex items-center gap-2">
-              {/* Quick scan button always visible for non-master sheets */}
-              {activeSheetId !== 'master' && (
+              {/* Quick scan button — only for Google Sheet sources */}
+              {activeSheetId !== 'master' && activeSheet?.spreadsheetId && (
                 <button onClick={()=>syncSheet(activeSheetId)} disabled={isSyncing}
                   className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-black bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg disabled:opacity-50 transition-colors">
                   <RefreshCcw className={cn('w-3 h-3', isSyncing && 'animate-spin')}/>
                   {isSyncing ? 'Scanning…' : 'Scan Again'}
                 </button>
               )}
+              {/* CSV import badge */}
+              {activeSheetId !== 'master' && !activeSheet?.spreadsheetId && (
+                <span className="flex items-center gap-1 px-2.5 py-1.5 text-[9px] font-black bg-violet-50 text-violet-600 border border-violet-200 rounded-lg">
+                  ↑ CSV Import
+                </span>
+              )}
               <SheetManager sheets={sheets} activeSheetId={activeSheetId} isConnected={isConnected} isSyncing={isSyncing}
                 onConnect={async()=>{try{const{url}=await fetch('/api/auth/url').then(r=>r.json());window.open(url,'_blank','width=600,height=700');}catch{showToast('❌ Auth failed');}}}
-                onAddSheet={addSheet} onRemoveSheet={removeSheet} onSwitchSheet={switchSheet} onSyncSheet={syncSheet}/>
+                onAddSheet={addSheet} onRemoveSheet={removeSheet} onSwitchSheet={switchSheet} onSyncSheet={syncSheet}
+                onImportCSV={importCSV}/>
               {!isConnected && <button onClick={()=>{}} className="text-[10px] font-bold text-zinc-400 flex items-center gap-1"><LinkIcon className="w-3 h-3"/>Connect</button>}
               <button onClick={onLogout}
                 className="flex items-center gap-1.5 px-2.5 py-1.5 text-[9px] font-black text-zinc-400 hover:text-rose-500 hover:bg-rose-50 border border-zinc-200 rounded-lg transition-all uppercase tracking-wide"
